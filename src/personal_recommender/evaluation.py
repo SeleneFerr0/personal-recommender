@@ -6,7 +6,18 @@ import math
 import random
 from .schema import instant
 from .engine import score, WEIGHTS
-from .learning import Model, design, fit, probabilities, temporal_split
+from .learning import Model, design, fit, fit_residual, probabilities, shown_work_ids, temporal_split
+
+# Validation grid for the residual model. "off" settings keep the linear model reachable, so
+# the selector can fall back when the extra capacity does not pay for itself.
+RESIDUAL_GRID = (
+    {"use_basis": False, "use_work": False},
+    {"use_basis": True, "use_work": False, "l2_basis": .01},
+    {"use_basis": True, "use_work": False, "l2_basis": .05},
+    {"use_basis": False, "use_work": True, "l2_work": .05},
+    {"use_basis": True, "use_work": True, "l2_basis": .01, "l2_work": .05},
+    {"use_basis": True, "use_work": True, "l2_basis": .05, "l2_work": .2},
+)
 
 
 def tie_metrics(scores, target, k):
@@ -25,7 +36,7 @@ def evaluate(catalog, observations, algorithm, model=None, k=3):
     per_profile={}
     for o in observations:
         rows,target=design(catalog,o)
-        scores=[score(algorithm,x,model) for x in rows]
+        scores=[score(algorithm,x,model,w) for x,w in zip(rows,shown_work_ids(catalog,o))]
         loss=-math.log(max(1e-15,probabilities(scores)[target]))
         hit,ndcg=(None,None) if target==len(rows) else tie_metrics(scores,target,k)
         per_profile.setdefault(o.request.profile_id,[]).append((loss,hit,ndcg))
@@ -59,11 +70,19 @@ def compare(catalog, observations, validation_at, test_at, k=3, epochs=160):
     train,valid,test=temporal_split(observations,validation_at,test_at)
     choice=fit(catalog,train,"choice",epochs=epochs)
     pairwise=fit(catalog,train,"pairwise",epochs=epochs)
+    # Residual model: hyperparameters chosen by validation choice log loss (a proper score).
+    trials=[]
+    for config in RESIDUAL_GRID:
+        candidate=fit_residual(catalog,train,epochs=epochs,**config)
+        trials.append((evaluate(catalog,valid,"residual",candidate,k)["choice_log_loss"],len(trials),candidate,config))
+    residual_loss,_,residual,residual_config=min(trials,key=lambda t:t[:2])
+    residual.metadata={**residual.metadata,"selected_config":residual_config,"selected_on":"validation choice_log_loss",
+                       "grid_size":len(RESIDUAL_GRID)}
     # Select a blend and champion on validation loss, never on test results.
     blends=[Model("adaptive",choice.weights,a,{**choice.metadata,"blend_selected_on":"validation"}) for a in (0.,.25,.5,.75,1.)]
     adaptive=min(blends,key=lambda m:evaluate(catalog,valid,"adaptive",m,k)["choice_log_loss"])
     adaptive.metadata={**adaptive.metadata,"last_observed_at":max(valid,key=lambda o:instant(o.observed_at)).observed_at}
-    models={"choice":choice,"pairwise":pairwise,"adaptive":adaptive}
+    models={"choice":choice,"pairwise":pairwise,"residual":residual,"adaptive":adaptive}
     names=[*WEIGHTS,*models]
     validation={n:evaluate(catalog,valid,n,models.get(n),k) for n in names}
     champion=min(names,key=lambda n:validation[n]["choice_log_loss"])
@@ -76,7 +95,8 @@ def compare(catalog, observations, validation_at, test_at, k=3, epochs=160):
         selected_weights=[adaptive.blend*w+(1-adaptive.blend)*h for w,h in zip(adaptive.weights,WEIGHTS["hybrid"])]
     else:
         selected_weights=list(models[rank_champion].weights)
-    models["selected"]=Model("selected",selected_weights,metadata={**choice.metadata,
+    selected_extra=residual.extra if rank_champion=="residual" else None
+    models["selected"]=Model("selected",selected_weights,extra=selected_extra,metadata={**choice.metadata,
         "last_observed_at":max(valid,key=lambda o:instant(o.observed_at)).observed_at,
         "selected_from":rank_champion,"selection_metric":"validation profile-macro tie-aware NDCG@k",
         "selection_k":k,
@@ -92,6 +112,6 @@ def compare(catalog, observations, validation_at, test_at, k=3, epochs=160):
         "selected_on_validation":champion,"ranking_selected_on_validation":rank_champion,"validation_selected_baseline":best_base,
         "validation":{n:clean(r) for n,r in validation.items()},"test":{n:clean(r) for n,r in results.items()},
         "ndcg_difference_vs_validation_baseline":intervals,
-        "adaptive_blend":adaptive.blend,
+        "adaptive_blend":adaptive.blend,"residual_config":residual_config,
         "conclusion":"Controlled synthetic result, not evidence of real audience uplift." if catalog.synthetic else "Held-out association/choice evaluation; does not establish causal uplift or universal superiority."}
     return report,models

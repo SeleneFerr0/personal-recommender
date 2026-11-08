@@ -12,7 +12,7 @@ import json
 import math
 from pathlib import Path
 from .schema import Request, instant, number
-from .engine import FEATURES, WEIGHTS, candidates, dot
+from .engine import BASIS, FEATURES, LEARNED, WEIGHTS, basis, candidates, dot
 
 
 def probabilities(scores):
@@ -46,6 +46,12 @@ class Observation:
         return cls(Request(**d["request"]), tuple(d["shown_ids"]), d["chosen_id"], d["observed_at"])
 
 
+def shown_work_ids(catalog, observation):
+    works = {s.production_id: s.work_id for s in catalog.shows}
+    perf = {p.performance_id: works[p.production_id] for p in catalog.performances}
+    return [perf[i] for i in observation.shown_ids]
+
+
 def design(catalog, observation):
     eligible, _ = candidates(catalog, observation.request)
     vectors = {p.performance_id:x for _,p,x,_ in eligible}
@@ -62,30 +68,48 @@ class Model:
     weights: list[float]
     blend: float = 1.
     metadata: dict | None = None
+    # Optional residual terms: {"basis_weights": [...len(BASIS)], "work_bias": {work_id: float}}
+    extra: dict | None = None
 
     def __post_init__(self):
-        if self.method not in {"pairwise", "choice", "adaptive", "selected"} or len(self.weights) != len(FEATURES):
+        if self.method not in LEARNED or len(self.weights) != len(FEATURES):
             raise ValueError("invalid model method or feature dimension")
         for w in self.weights:
             number(w, "model weight")
         number(self.blend, "blend", 0, 1)
+        if self.extra is not None:
+            if self.method not in {"residual", "selected"} or set(self.extra) - {"basis_weights", "work_bias"}:
+                raise ValueError("residual terms only allowed on residual/selected models")
+            bw = self.extra.get("basis_weights")
+            if bw is not None and len(bw) != len(BASIS):
+                raise ValueError("basis dimension mismatch")
+            for w in [*(bw or []), *self.extra.get("work_bias", {}).values()]:
+                number(w, "residual weight")
 
     @property
     def model_id(self):
-        blob=json.dumps({"method":self.method,"weights":self.weights,"blend":self.blend,"metadata":self.metadata},sort_keys=True)
-        return hashlib.sha256(blob.encode()).hexdigest()[:16]
+        body={"method":self.method,"weights":self.weights,"blend":self.blend,"metadata":self.metadata}
+        if self.extra is not None:
+            body["extra"]=self.extra
+        return hashlib.sha256(json.dumps(body,sort_keys=True).encode()).hexdigest()[:16]
 
     def save(self, path):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         payload={"format_version":1,"features":list(FEATURES),**asdict(self),"model_id":self.model_id}
+        if self.extra is None:
+            payload.pop("extra")
+        else:
+            payload.update(format_version=2,basis=list(BASIS))
         Path(path).write_text(json.dumps(payload,allow_nan=False,indent=2)+"\n")
 
     @classmethod
     def load(cls,path):
         d=json.loads(Path(path).read_text())
-        if d.get("format_version") != 1 or d.get("features") != list(FEATURES):
+        if d.get("format_version") not in (1, 2) or d.get("features") != list(FEATURES):
             raise ValueError("incompatible model format or feature order")
-        result=cls(d["method"], d["weights"], d["blend"], d.get("metadata"))
+        if d["format_version"] == 2 and d.get("basis") != list(BASIS):
+            raise ValueError("incompatible residual basis")
+        result=cls(d["method"], d["weights"], d["blend"], d.get("metadata"), d.get("extra"))
         if result.model_id != d.get("model_id"):
             raise ValueError("model hash mismatch")
         return result
@@ -124,6 +148,61 @@ def fit(catalog, observations, method="choice", epochs=160, lr=.08, l2=.01):
             weights[k]-=lr*(momentum[k]/(1-.9**step))/(math.sqrt(variance[k]/(1-.999**step))+1e-8)
     data_hash=hashlib.sha256(json.dumps([o.to_dict() for o in observations],sort_keys=True).encode()).hexdigest()
     return Model(method,weights,metadata={"train_rows":len(observations),"epochs":epochs,"l2":l2,
+        "last_observed_at":max(observations,key=lambda o:instant(o.observed_at)).observed_at,
+        "train_sha256":data_hash,"synthetic_training":catalog.synthetic})
+
+
+def fit_residual(catalog, observations, epochs=160, lr=.08, l2=.01, l2_basis=.01, l2_work=.05,
+                 use_basis=True, use_work=True):
+    """Conditional logit (with outside option) plus a hinge/cross basis and per-work effects.
+
+    U_ij = w.x_ij + v.phi(x_ij) + b_work(j);  U_outside = 0.
+    Penalised MLE: l2 pulls w toward the hybrid prior (MAP with a Gaussian prior), l2_basis
+    shrinks v toward 0 (linear model as the fallback), l2_work shrinks unseen/rare works to 0.
+    """
+    if not observations or epochs < 1 or lr <= 0 or min(l2, l2_basis, l2_work) < 0:
+        raise ValueError("invalid training inputs")
+    data=[]
+    for o in observations:
+        rows,target=design(catalog,o)
+        data.append((rows,[basis(x) for x in rows],shown_work_ids(catalog,o),target))
+    prior=list(WEIGHTS["hybrid"])
+    weights,vb=list(prior),[0.]*len(BASIS)
+    keys=sorted({k for *_,works,_ in data for k in works}) if use_work else []
+    bias={k:0. for k in keys}
+    size=len(weights)+len(vb)+len(keys)
+    momentum,variance=[0.]*size,[0.]*size
+    for step in range(1,epochs+1):
+        gw,gv,gb=[0.]*len(weights),[0.]*len(vb),{k:0. for k in keys}
+        for rows,phis,works,target in data:
+            p=probabilities([dot(weights,x)+dot(vb,f)+bias.get(k,0.) for x,f,k in zip(rows,phis,works)])
+            for j,(x,f,k) in enumerate(zip(rows,phis,works)):
+                error=p[j]-float(j==target)
+                for i,value in enumerate(x):
+                    gw[i]+=error*value
+                if use_basis:
+                    for i,value in enumerate(f):
+                        gv[i]+=error*value
+                if use_work:
+                    gb[k]+=error
+        n=len(data)
+        grads=[g/n+l2*(w-a) for g,w,a in zip(gw,weights,prior)]
+        grads+=[g/n+l2_basis*v for g,v in zip(gv,vb)]
+        grads+=[gb[k]/n+l2_work*bias[k] for k in keys]
+        for i,g in enumerate(grads):
+            momentum[i]=.9*momentum[i]+.1*g
+            variance[i]=.999*variance[i]+.001*g*g
+            delta=lr*(momentum[i]/(1-.9**step))/(math.sqrt(variance[i]/(1-.999**step))+1e-8)
+            if i<len(weights):
+                weights[i]-=delta
+            elif i<len(weights)+len(vb):
+                vb[i-len(weights)]-=delta
+            else:
+                bias[keys[i-len(weights)-len(vb)]]-=delta
+    data_hash=hashlib.sha256(json.dumps([o.to_dict() for o in observations],sort_keys=True).encode()).hexdigest()
+    extra={"basis_weights":vb if use_basis else None,"work_bias":bias}
+    return Model("residual",weights,extra=extra,metadata={"train_rows":len(observations),"epochs":epochs,
+        "l2_prior":l2,"l2_basis":l2_basis if use_basis else None,"l2_work":l2_work if use_work else None,
         "last_observed_at":max(observations,key=lambda o:instant(o.observed_at)).observed_at,
         "train_sha256":data_hash,"synthetic_training":catalog.synthetic})
 

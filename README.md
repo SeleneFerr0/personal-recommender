@@ -24,6 +24,7 @@ To run without installing the package: `PYTHONPATH=src python -m personal_recomm
 - Ticket snapshots with provenance, verification time, and expiry. Strict mode excludes unknown critical conditions; `allow_unverified=true` returns explicitly pending-verification candidates without guaranteeing that tickets can be purchased. Cancelled performances do not become eligible again when a snapshot expires.
 - Interpretable features for content match, aversion, price and time fit, familiarity, popularity, minimum and mean party preference match, and interaction terms.
 - Four fixed baselines: popularity, content, context, and hybrid. Learning methods include pairwise logistic regression, conditional logit with an outside/no-choice option, validation-selected blend weights, and a `selected` ranking method chosen by validation NDCG.
+- `residual` conditional logit: the linear choice utility plus a fixed hinge-spline/cross-term basis and shrunk per-work effects, `U = w·x + v·φ(x) + b_work`. Linear weights are regularized toward the `hybrid` prior (MAP), basis weights and work effects toward zero. A six-point grid, including an all-off setting equivalent to the linear model, is chosen by validation choice log loss. Saved residual models use model format version 2, which records the basis order; version 1 models still load. Explanations add `nonlinear_residual` and `work_effect` contributions.
 - Work-level deduplication across performances and configurable simple diversity reranking. Results include raw scores, feature contributions, and rejection reasons. Scores are not purchase probabilities.
 - A candidate-attribute disagreement heuristic for suggesting the next preference question. This is a simple research entry point; it does not implement an LLM or an experimentally validated optimal questioning policy.
 - JSON model files with feature-order, hash, and time checks. Models trained on synthetic data cannot be applied to catalogs marked as real.
@@ -34,6 +35,8 @@ Generating synthetic data validates execution; it does not provide real Disney d
 
 ```bash
 personal-rec simulate --output-dir data/sim --n 360 --regime mixed
+# Regimes: content, context, popularity, mixed, nonlinear, latent.
+# latent = mixed plus a hidden per-work appeal (word of mouth, IP strength) not present in the features.
 # Read the split times in data/sim/manifest.json, then run:
 personal-rec compare --catalog data/sim/catalog.json \
   --observations data/sim/observations.json \
@@ -44,7 +47,7 @@ personal-rec benchmark --seeds 7,19,43 --n 600 --epochs 180 \
   --output artifacts/stress-test.json
 ```
 
-`compare` trains the learning methods and uses only validation data to choose the adaptive blend by log loss and the `selected` ranking method by NDCG, breaking ties by log loss. It retains all test results, including methods that do not win. `selected` can choose a simple baseline when it performs better; it is not guaranteed to win on the test set. Selection adds a validation search over seven candidate methods, with no additional fitting. Training, validation, and test sets are split by time, with cross-partition profiles and label windows purged. Test results do not influence model selection.
+`compare` trains the learning methods and uses only validation data to choose the adaptive blend by log loss and the `selected` ranking method by NDCG, breaking ties by log loss. It retains all test results, including methods that do not win. `selected` can choose a simple baseline when it performs better; it is not guaranteed to win on the test set. Selection adds a validation search over eight candidate methods; the residual grid adds six fits on training data, scored only on validation. Training, validation, and test sets are split by time, with cross-partition profiles and label windows purged. Test results do not influence model selection.
 
 Evaluation uses the actually displayed choice sets in the input logs. NDCG and Hit are conditional on an item being chosen; choice log loss includes the no-choice option. Tied scores use the exact expected metric under random tie-breaking. Metrics are macro-averaged by profile, and difference intervals use paired profile bootstrap. This is neither a full-catalog retrieval benchmark nor a causal incrementality experiment. The CLI currently supports a research comparison workflow; an online experimentation service is not implemented.
 

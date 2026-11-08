@@ -16,6 +16,29 @@ WEIGHTS = {
 }
 
 
+# Fixed nonlinear basis for the residual choice model: hinge splines on continuous
+# features plus a few cross terms. Order is part of the saved model contract.
+HINGE_FEATURES = ("content", "price_fit", "time_fit", "popularity", "group_min", "content_time")
+HINGE_KNOTS = (.25, .5, .75)
+CROSS_FEATURES = (("price_fit", "time_fit"), ("content", "group_min"), ("price_fit", "group_min"),
+                  ("content", "popularity"), ("time_fit", "group_min"))
+BASIS = tuple(f"{f}>{k}" for f in HINGE_FEATURES for k in HINGE_KNOTS) + tuple(f"{a}*{b}" for a, b in CROSS_FEATURES)
+_IDX = {f: i for i, f in enumerate(FEATURES)}
+LEARNED = ("pairwise", "choice", "residual", "adaptive", "selected")
+
+
+def basis(x):
+    return [max(0., x[_IDX[f]] - k) for f in HINGE_FEATURES for k in HINGE_KNOTS] + \
+           [x[_IDX[a]] * x[_IDX[b]] for a, b in CROSS_FEATURES]
+
+
+def residual(model, x, work_id=None):
+    """Nonlinear basis and shrunk work effect; zero for models without them."""
+    extra = getattr(model, "extra", None) or {}
+    value = dot(extra["basis_weights"], basis(x)) if extra.get("basis_weights") else 0.
+    return value + extra.get("work_bias", {}).get(work_id, 0.)
+
+
 def eligibility(show: Show, perf: Performance, request: Request):
     """Unknown critical facts never turn into a claim of confirmed bookability."""
     now = instant(request.at)
@@ -104,15 +127,15 @@ def dot(a, b):
     return sum(x*y for x, y in zip(a, b))
 
 
-def score(name, x, model=None):
+def score(name, x, model=None, work_id=None):
     if name in WEIGHTS:
         return dot(WEIGHTS[name], x)
-    if name in {"pairwise", "choice", "adaptive", "selected"}:
+    if name in LEARNED:
         if model is None:
             raise ValueError("trained model required")
         if name != model.method:
             raise ValueError("algorithm must match saved model method")
-        learned = dot(model.weights, x)
+        learned = dot(model.weights, x) + residual(model, x, work_id)
         if name == "adaptive":
             return model.blend*learned + (1-model.blend)*dot(WEIGHTS["hybrid"], x)
         return learned
@@ -139,7 +162,7 @@ def recommend(catalog, request, algorithm="hybrid", model=None, k=5, diversity=.
         raise ValueError("k must be positive")
     if not math.isfinite(diversity) or not 0 <= diversity <= 1 or max_per_work < 1:
         raise ValueError("invalid diversity or work quota")
-    if algorithm not in WEIGHTS and algorithm not in {"pairwise", "choice", "adaptive", "selected"}:
+    if algorithm not in WEIGHTS and algorithm not in LEARNED:
         raise ValueError("unknown algorithm")
     if algorithm not in WEIGHTS and (model is None or model.method != algorithm):
         raise ValueError("matching trained model required")
@@ -148,7 +171,7 @@ def recommend(catalog, request, algorithm="hybrid", model=None, k=5, diversity=.
     if model and model.metadata and model.metadata.get("synthetic_training", False) and not catalog.synthetic:
         raise ValueError("synthetic-trained model is restricted to synthetic catalogs")
     rows, rejected = candidates(catalog, request)
-    pool = [(score(algorithm, x, model), s, p, x, unknown) for s,p,x,unknown in rows]
+    pool = [(score(algorithm, x, model, s.work_id), s, p, x, unknown) for s,p,x,unknown in rows]
     selected, count = [], {}
     while pool and len(selected) < k:
         eligible = [r for r in pool if count.get(r[1].work_id, 0) < max_per_work]
@@ -164,9 +187,13 @@ def recommend(catalog, request, algorithm="hybrid", model=None, k=5, diversity=.
         pool.remove(best)
     results = []
     for value, show, perf, x, unknown in selected:
-        contributions = {f: w*v for f,w,v in zip(FEATURES, model.weights if model and algorithm in {"choice","pairwise","selected"} else WEIGHTS["hybrid"] if algorithm=="adaptive" else WEIGHTS[algorithm], x)}
+        contributions = {f: w*v for f,w,v in zip(FEATURES, model.weights if model and algorithm in {"choice","pairwise","residual","selected"} else WEIGHTS["hybrid"] if algorithm=="adaptive" else WEIGHTS[algorithm], x)}
         if algorithm == "adaptive":
             contributions = {f: (model.blend*w+(1-model.blend)*h)*v for f,w,h,v in zip(FEATURES,model.weights,WEIGHTS["hybrid"],x)}
+        if model is not None and getattr(model, "extra", None):
+            extra = model.extra
+            contributions["nonlinear_residual"] = dot(extra.get("basis_weights") or [0.]*len(BASIS), basis(x))
+            contributions["work_effect"] = extra.get("work_bias", {}).get(show.work_id, 0.)
         results.append({"work_id": show.work_id, "production_id": show.production_id,
                         "title": show.title, "performance": asdict(perf), "score": value,
                         "bookability": "requires_verification" if unknown else "verified_snapshot",

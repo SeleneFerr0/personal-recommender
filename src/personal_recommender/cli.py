@@ -7,7 +7,7 @@ import sys
 import time
 import platform
 from .schema import Catalog, Request
-from .engine import recommend,WEIGHTS
+from .engine import recommend,LEARNED,WEIGHTS
 from .learning import Model,Observation
 from .evaluation import compare
 from .synthetic import REGIMES, demo_request, generate,make_catalog
@@ -38,7 +38,7 @@ def main(argv=None):
     rec=sub.add_parser("recommend")
     rec.add_argument("--catalog",required=True)
     rec.add_argument("--request",required=True)
-    rec.add_argument("--algorithm",choices=[*WEIGHTS,"choice","pairwise","adaptive","selected"],default="hybrid")
+    rec.add_argument("--algorithm",choices=[*WEIGHTS,*LEARNED],default="hybrid")
     rec.add_argument("--model")
     rec.add_argument("--k",type=int,default=5)
     rec.add_argument("--output")

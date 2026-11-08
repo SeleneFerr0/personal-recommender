@@ -6,7 +6,9 @@ from .engine import candidates, dot
 from .learning import Observation, probabilities
 
 TAGS=("adventure","comedy","dance","orchestra","family","romance","spectacle","drama")
-REGIMES=("content","context","popularity","mixed","nonlinear")
+# "latent": mixed utility plus a per-work appeal hidden from the features (reviews, word of
+# mouth, IP strength). Tests whether a model can learn work-level effects from choice logs.
+REGIMES=("content","context","popularity","mixed","nonlinear","latent")
 
 
 def make_catalog(seed=7, size=16):
@@ -42,7 +44,10 @@ def generate(seed=7, regime="mixed", n=360):
         "popularity":[-1.,0,0,0,0,0,5,0,0,0,0,0],
         "mixed":[-1.5,2,3,1.5,1,.3,.4,2,1,3,2,0],
         "nonlinear":[-1.5,1,2,1,1,0,0,1,1,0,0,0],
+        "latent":[-1.5,2,3,1.5,1,.3,.4,2,1,3,2,0],
     }
+    appeal_rng=random.Random(seed+202)
+    appeal={s.work_id:appeal_rng.gauss(0,1) for s in catalog.shows}
     observations=[]
     for i in range(n):
         prefs={tag:rng.uniform(.2,1) for tag in rng.sample(TAGS,3)}
@@ -67,6 +72,8 @@ def generate(seed=7, regime="mixed", n=360):
         if regime=="nonlinear":
             import math
             utilities=[v+2*math.sin(7*x[1]*x[4])-3*(x[3]-.5)**2 for v,(_,_,x,_) in zip(utilities,shown)]
+        if regime=="latent":
+            utilities=[v+appeal[s.work_id] for v,(s,_,_,_) in zip(utilities,shown)]
         probs=probabilities(utilities)
         chosen=rng.choices(list(range(len(shown)+1)),weights=probs)[0]
         ids=tuple(p.performance_id for _,p,_,_ in shown)

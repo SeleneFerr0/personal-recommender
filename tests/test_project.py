@@ -6,7 +6,8 @@ import unittest
 
 from personal_recommender.schema import Catalog,Performance,Request,Show,instant
 from personal_recommender.engine import candidates,eligibility,features,recommend,FEATURES
-from personal_recommender.learning import Model,Observation,fit,probabilities,temporal_split,design
+from personal_recommender.learning import Model,Observation,fit,fit_residual,probabilities,temporal_split,design
+from personal_recommender.engine import BASIS,basis
 from personal_recommender.evaluation import tie_metrics,evaluate,compare
 from personal_recommender.synthetic import demo_request,generate,make_catalog
 from personal_recommender.elicitation import suggest_question
@@ -222,6 +223,37 @@ class Learning(unittest.TestCase):
         self.assertIn(models["adaptive"].blend,(0,.25,.5,.75,1))
         winner=report["ranking_selected_on_validation"]
         self.assertAlmostEqual(report["validation"]["selected"]["ndcg_at_k"],report["validation"][winner]["ndcg_at_k"])
+
+    def test_residual_disabled_terms_match_linear_choice(self):
+        train,_,_=temporal_split(self.obs,self.val,self.test)
+        r=fit_residual(self.cat,train,epochs=20,l2=0,use_basis=False,use_work=False)
+        c=fit(self.cat,train,"choice",epochs=20,l2=0)
+        for a,b in zip(r.weights,c.weights):
+            self.assertAlmostEqual(a,b,places=9)
+        self.assertEqual(r.extra["work_bias"],{})
+
+    def test_residual_fits_and_roundtrips_with_work_effects(self):
+        train,_,_=temporal_split(self.obs,self.val,self.test)
+        m=fit_residual(self.cat,train,epochs=30)
+        self.assertEqual(len(m.extra["basis_weights"]),len(BASIS))
+        self.assertTrue(m.extra["work_bias"])
+        self.assertLess(evaluate(self.cat,train,"residual",m)["choice_log_loss"],evaluate(self.cat,train,"hybrid")["choice_log_loss"])
+        with tempfile.TemporaryDirectory() as d:
+            p=Path(d)/"residual.json"
+            m.save(p)
+            self.assertEqual(Model.load(p).model_id,m.model_id)
+            payload=json.loads(p.read_text());payload["basis"].reverse();p.write_text(json.dumps(payload))
+            with self.assertRaisesRegex(ValueError,"basis"):
+                Model.load(p)
+        out=recommend(self.cat,replace(self.obs[-1].request,at="2030-01-05T00:00:00Z"),"residual",m)
+        self.assertIn("work_effect",out["results"][0]["score_contributions"])
+
+    def test_residual_terms_rejected_on_linear_models(self):
+        with self.assertRaises(ValueError):
+            Model("choice",[0.]*len(FEATURES),extra={"work_bias":{}})
+        with self.assertRaises(ValueError):
+            Model("residual",[0.]*len(FEATURES),extra={"basis_weights":[0.]})
+        self.assertEqual(len(basis([.5]*len(FEATURES))),len(BASIS))
 
     def test_cli_demo(self):
         with tempfile.TemporaryDirectory() as d:
