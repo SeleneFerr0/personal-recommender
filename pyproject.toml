@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "personal-theatre-recommender"
+version = "0.1.0"
+description = "Constraint-aware theatre recommendation and reproducible choice-model comparisons"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+personal-rec = "personal_recommender.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

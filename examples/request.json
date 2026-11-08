@@ -1,0 +1,39 @@
+{
+  "request_id": "demo",
+  "profile_id": "demo-profile",
+  "at": "2030-01-03T12:00:00Z",
+  "cities": [
+    "New York"
+  ],
+  "start_date": "2030-01-10",
+  "end_date": "2030-01-12",
+  "budget": 300,
+  "party_size": 2,
+  "budget_mode": "total",
+  "currency": "USD",
+  "preferences": {
+    "family": 1,
+    "spectacle": 0.8,
+    "drama": -0.5
+  },
+  "member_preferences": [
+    {
+      "family": 1
+    },
+    {
+      "dance": 1,
+      "comedy": 0.5
+    }
+  ],
+  "avoid_tags": [],
+  "languages": [
+    "en"
+  ],
+  "youngest_age": null,
+  "preferred_hour": 19,
+  "requires_accessibility": false,
+  "require_consecutive": true,
+  "allow_unverified": false,
+  "seen_work_ids": [],
+  "allow_repeats": true
+}
